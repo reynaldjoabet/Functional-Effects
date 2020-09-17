@@ -1,5 +1,7 @@
+import scala.util.Success
 
 object HelloWorld  {
+  def main(args: Array[String]): Unit = Runtime.unsafeRunAsync(num)(_ =>())
 
   val program: IO[Unit] =for{
     _ <-IO.delay(println("Good morning, what is your name?"))
@@ -8,17 +10,20 @@ object HelloWorld  {
   } yield ()
 
 
-  val foo=IO.delay(println("foo")).as(0)
-  val io1: IO[Int] =(1 to 3).foldLeft(IO.pure(0))((b, _)=>
-    b.flatMap(elem=>foo.map(_ =>elem+1)))
-  //println(io1)
+// a program that never ends when started
+  val foo=IO.delay(println("foo")).forever
+  val io1: IO[Int] =(1 to 100).foldLeft(IO.pure(0))((b, _)=>
+    b.flatMap(elem=>foo.map{p =>println(elem+1);elem+1}))
+
   val error: IO[Nothing] = IO.raiseError(new NoSuchElementException)
-  //println(error)
-  
-  val num=(IO.pure(12+12).as("Hello").map(_.toUpperCase))
-println(num)
 
 
-  
+  val num=(IO.pure(12+12).as("Hello").map(_.toUpperCase)).forever
+
+  val zip=foo.zip(num)
+  val fromeither: IO[String] =IO.fromEither(Right("This is from Either"))
+  val fromtry: IO[String] =IO.fromTry(Success("This is from Try"))
+  val keepRight=fromeither.keepRight(fromtry)
+
 
 }
