@@ -1,60 +1,90 @@
 import scala.concurrent.Promise
+import scala.util.Failure
+import scala.util.Success
+import scala.util.Try
+import scala.concurrent.Await
 import scala.concurrent.duration.Duration
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.Executors
+import IO._
+import scala.concurrent.Future
 
-
-trait Runtime {
-  def unsafeRunAsync[A](value: IO[A])(callback:Either[Throwable,A]=>Unit):Unit
-
- def unsafeRunSync[A] (value: IO[A]):Either[Throwable,A]
-
+object Runtime {
+private def executor(a: =>Unit):Unit={
+    Executors.newWorkStealingPool.submit(
+        new Runnable{
+            override def run():Unit= a
+        } 
+    )
 }
-object  Runtime extends Runtime{
-  import scala.concurrent.Await
-  import scala.concurrent.ExecutionContext.Implicits.global
-  import scala.concurrent.Future
-  import IO._
-def unsafeRunSync[A](value: IO[A]):Either[Throwable,A]={
 
-   Await.ready(unsafeRunToFuture(value),Duration.Inf).value.get.toEither
- }
+  def run[A](t:IO[A])=unsafeRunToFuture(t).value.get
 
- private def unsafeRunToFuture[A](value: IO[A]):Future[A]={
-    val promise= Promise[A]()
-unsafeRunAsync(value)(_.fold(e=>promise.failure(e),promise.success))
-    promise.future
- }
-  def unsafeRunAsync[A](value: IO[A])(callback:Either[Throwable,A]=>Unit):Unit= runLoop(value)(callback)
+  def runAsync[A](io:IO[A])(cb:(Try[A]=>Unit))= new RuntimeFiber(io).register(cb).start()
 
-  private[this] def runLoop[A](io:IO[A])(callback:Either[Throwable,A]=>Unit):Unit= io match {
-    case Pure(a) =>println("Pure")
-      callback(Right(a))
 
-    case Delay(t) =>println(" Delay")
-      callback(Right(t()))
-    case FlatMap(iof, f1: (Any => IO[Any])) => println("Flatmap")
-      iof match {
-        case Pure(a) => runLoop(f1(a))(callback)
-        case Delay(t) =>runLoop(f1(t()))(callback)
-        case FlatMap(ioff, f: (Any => IO[Any])) =>
-        runLoop(ioff.flatMap(a=>f(a) flatMap(f1)))(callback.asInstanceOf[Either[Throwable,Any]=>Unit])
-        case Suspend(t) =>
-        runLoop(t().flatMap(a=>f1(a)))(callback)
-        case RaiseError(e) =>
-        callback(Left(e))
-        case Async(f) =>
-        f(callback.asInstanceOf[Either[Throwable,Any]=>Unit])
-       // case Attempt(io2) => io2.flatMap(a=>)
-
-    }
-    case Suspend(t) =>println("Suspend")
-      runLoop(t())(callback)
-    case RaiseError(e) =>println("RaiseError")
-      callback(Left(e))
-    case Async(f) =>println("Async")
-      f(callback)
-    //case Attempt(io) =>  runLoop(io)(callback.asInstanceOf[Either[Throwable,Any]=>Unit])
+  def unsafeRunToFuture[A](io:IO[A]): Future[A]={
+      val promise= Promise[A]()
+      runAsync(io)((promise.tryComplete _).asInstanceOf[Try[A]=>Unit])// we capture the callback here
+      Await.ready(promise.future,Duration.Inf) 
+      promise.future   
 
   }
-  
+
+final  class RuntimeFiber[A](io:IO[A]) extends Fiber[A]{ self=>
+   type Callback[B]=Try[B]=>Unit 
+
+   private  val joined: AtomicReference[Set[Callback[A]]]= new AtomicReference[Set[Callback[A]]](Set.empty)
+
+   private val result: AtomicReference[Option[Try[A]]]= new AtomicReference[Option[Try[A]]](None)
+
+
+   def register(cb:Callback[A]): RuntimeFiber[A]={
+       joined.updateAndGet(_+cb)
+       result.get().foreach(cb)
+       self
+   }
+
+   def fiberDone(a:Try[Any])={
+       result.set(Some(a.asInstanceOf[Try[A]]))
+       joined.get.foreach(cb=>cb(a.asInstanceOf[Try[A]]))
+      //joined.get.foreach(println) for better understanding 
+      //println("Hello after fiber")
+   }
+
+
+
+   def start(): RuntimeFiber[A]={
+       eval(io)(fiberDone)
+       self
+   }
+
+
+   def eval[A](io:IO[A])(cb:(Try[A])=>Unit):Unit= executor{
+       io match {
+           case Pure(a) => cb(Success(a))
+           case Suspend(t) => eval(t()){
+             case Failure(exception) => cb(Failure(exception))
+            case Success(value) =>cb(Success(value))
+           }
+           case Fork(tio) => cb(Success(new RuntimeFiber(tio).start()))
+           case FlatMap(self:IO[Any], f) => eval(self){
+               case Failure(exception) => cb(Failure(exception))
+                case Success(value) => eval(f(value.asInstanceOf[A]))(cb)
+           }
+           case HandleErrorWith(self:IO[Any], f) =>
+               eval(self){
+                    case Success(value) => cb(Success(value.asInstanceOf[A]))
+                    case Failure(exception) => eval(f(exception))(cb)
+               }
+
+           case RaiseError(e) =>cb(Failure(e))
+           case Delay(b) =>cb(Success(b()))
+           case Join(fi) => fi.asInstanceOf[RuntimeFiber[A]].register(cb)
+           case Async(register) =>register(cb)
+       }
+    }
+   }
+
 
 }

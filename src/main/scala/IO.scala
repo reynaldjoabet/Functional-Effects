@@ -18,14 +18,16 @@ sealed trait IO[+A] {
   def flatten[B](implicit ev: A <:< IO[B]): IO[B] = flatMap(a => a)
 
   //def option:IO[Option[A]]= ???
-  //def handleErrorWith[B>:A](t: Throwable=>IO[B]):IO[B]=HandleErrorWith(self,t)
+  def handleErrorWith[B>:A](t: Throwable=>IO[B]):IO[B]=HandleErrorWith(self,t)
+  def fork:IO[Fiber[A]]=IO.Fork(self)
+
   def unit: IO[Unit] = map(_ => ())
 
   def keepRight[B](that: IO[B]): IO[B] = self.flatMap(_ => that)
   //alias for keepRight
   def *>[B](that: IO[B]): IO[B] = keepRight(that)
   def keepLeft[B](that: IO[B]): IO[A] = flatMap(that.as(_))
-def <*[B](that: IO[B]): IO[A] = keepLeft(that)
+  def <*[B](that: IO[B]): IO[A] = keepLeft(that)
   def zip[B](that: IO[B]): IO[(A, B)] = self.flatMap(a => that.map(b => (a, b)))
 
 //def attempt:IO[Either[Throwable,A]]=IO.Attempt(self)
@@ -64,8 +66,15 @@ def <*[B](that: IO[B]): IO[A] = keepLeft(that)
     }
 
      */
+ def foreach[A, B](xs: Iterable[A])(f: A => IO[B]): IO[Iterable[B]] =
+    xs.foldLeft(IO.succeed(Vector.empty[B]))((acc, curr) => for {
+      soFar <- acc
+      x <- f(curr)
+    } yield soFar :+ x)
 
-
+def foreachPar[A, B](xs: Iterable[A])(f: A => IO[B]): IO[Iterable[B]] = {
+    foreach(xs)(x => f(x).fork).flatMap( fibers => foreach(fibers)(_.join))
+  }
     def fromEither[A](either: =>Either[Throwable,A]):IO[A]=either.fold(raiseError(_),pure(_))
 
      // constructs an IO from Try
@@ -84,22 +93,22 @@ def <*[B](that: IO[B]): IO[A] = keepLeft(that)
           case Some(value) => pure(value)
           case None => raiseError(exception)
       }
-    def async[A](f:(Either[Throwable,A]=>Unit)=>Unit):IO[A]= Async(f)
+    def async[A](f:(Try[A]=>Unit)=>Unit):IO[A]= Async(f)
     //def cancellable[A](callback:(Either[Throwable,A]=>Unit)=>IO[Unit]):IO[A]= ???
 
     //System.exit()
 
 
 
-def never: IO[Nothing] =IO.async(_=>())
+   def never: IO[Nothing] =IO.async(_=>())
 
     def fromFuture[A](future : => IO[Future[A]])(implicit ec:ExecutionContext): IO[A] = async[A] { cb =>
       val promise =Promise[A]()
         future.map { fut: Future[A] =>
           fut.onComplete {
 
-            case Failure(exception) =>  cb(Left(exception));promise.failure(exception)
-            case Success(value) => cb(Right(value));promise.success(value)
+            case Failure(exception) =>  cb(Failure(exception));promise.failure(exception)
+            case Success(value) => cb(Success(value));promise.success(value)
           }
 
         }
@@ -110,7 +119,7 @@ def never: IO[Nothing] =IO.async(_=>())
     def fromCompletableFuture[A](f: => CompletableFuture[A]):IO[A]={
       IO.async{callback=>
         f.whenComplete{(res:A,error:Throwable)=>
-          if(error==null) callback(Right(res)) else callback(Left(error))
+          if(error==null) callback(Success(res)) else callback(Failure(error))
         }
 
       }
@@ -124,12 +133,17 @@ def never: IO[Nothing] =IO.async(_=>())
  //final case object   Canceled extends IO[Nothing]
    // final case class RaiseError[+A](e:Throwable) extends IO[A]
    // since A is covariant, we can write the following
-   final case class RaiseError(e:Throwable) extends IO[Nothing]
-    final case class Async[+A](f:(Either[Throwable,A]=>Unit)=>Unit) extends IO[A]
-//final case class HandleErrorWith[A](io:IO[A],f:Throwable=>IO[A]) extends IO[A]
+    final case class RaiseError(e:Throwable) extends IO[Nothing]
+    final case class Async[+A](f:(Try[A]=>Unit)=>Unit) extends IO[A]
+    final  case class Join[A](fi:Fiber[A]) extends IO[A]
+    final case class Fork[A](tio:IO[A]) extends IO[Fiber[A]]
+   final case class HandleErrorWith[A,A1<:A](self:IO[A],f:Throwable=>IO[A1]) extends IO[A]
 
 //final case class Attempt[A](io:IO[A]) extends IO[Either[Throwable,A]]
+  }
 
 
+  abstract class Fiber[+A]{ self=>
 
+  def join:IO[A]=IO.Join(self)
   }
